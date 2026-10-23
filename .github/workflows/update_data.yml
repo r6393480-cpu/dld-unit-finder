@@ -15,7 +15,7 @@ permissions:
 jobs:
   update-data:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
 
     steps:
       - name: Checkout repository
@@ -29,8 +29,20 @@ jobs:
       - name: Install dependencies
         run: pip install requests
 
-      - name: Download CSV and convert to SQLite
-        run: python convert_csv_to_db.py
+            - name: Download CSV and convert to SQLite
+        run: |
+          for attempt in 1 2 3; do
+            echo "Attempt $attempt of 3"
+            if python convert_csv_to_db.py; then
+              exit 0
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              echo "Download failed. Waiting 60 seconds before retry..."
+              sleep 60
+            fi
+          done
+          echo "All 3 attempts failed."
+          exit 1
 
       - name: Compress database
         run: |
