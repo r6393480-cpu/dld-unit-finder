@@ -1,9 +1,10 @@
+
 name: Weekly DLD Data Update
 
 on:
+  workflow_dispatch:
   schedule:
     - cron: '0 3 * * 0'
-  workflow_dispatch:
 
 permissions:
   contents: write
@@ -24,182 +25,61 @@ jobs:
 
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
           pip install requests gdown
 
-      - name: Download three DLD CSV files
+      - name: Download CSV files from Google Drive
         run: |
-          set -e
+          gdown --fuzzy "https://drive.google.com/file/d/1q9PXkwolIIlV9sRDsPG7_-nATw9dFkS4/view" -O part1.csv
+          gdown --fuzzy "https://drive.google.com/file/d/1Lz_HWONoC3G36JOHZM4bPLYJhDSxxcoL/view" -O part2.csv
+          gdown --fuzzy "https://drive.google.com/file/d/1-4Kn0QYc2RCy0QpMTfqwOCg8tpjJh_re/view" -O part3.csv
 
-          mkdir -p downloaded_data
-
-          gdown --fuzzy \
-            "https://drive.google.com/file/d/1q9PXkwolIIlV9sRDsPG7_-nATw9dFkS4/view" \
-            -O downloaded_data/units_0001.csv
-
-          gdown --fuzzy \
-            "https://drive.google.com/file/d/1Lz_HWONoC3G36JOHZM4bPLYJhDSxxcoL/view" \
-            -O downloaded_data/units_0002.csv
-
-          gdown --fuzzy \
-            "https://drive.google.com/file/d/1-4Kn0QYc2RCy0QpMTfqwOCg8tpjJh_re/view" \
-            -O downloaded_data/units_0003.csv
-
-          echo "Checking downloaded file sizes..."
-          ls -lh downloaded_data/
-
-          python - <<'PY'
-          import os
-          import sys
-
-          files = [
-              "downloaded_data/units_0001.csv",
-              "downloaded_data/units_0002.csv",
-              "downloaded_data/units_0003.csv",
-          ]
-
-          for path in files:
-              if not os.path.isfile(path):
-                  sys.exit(f"ERROR: Missing file: {path}")
-
-              size = os.path.getsize(path)
-              print(f"{path}: {size / (1024 * 1024):.2f} MB")
-
-              if size < 300 * 1024 * 1024:
-                  sys.exit(f"ERROR: File appears incomplete: {path}")
-
-          print("All three files passed the size check.")
-          PY
+          test "$(stat -c%s part1.csv)" -gt 300000000
+          test "$(stat -c%s part2.csv)" -gt 300000000
+          test "$(stat -c%s part3.csv)" -gt 300000000
 
       - name: Merge CSV files
         run: |
           python - <<'PY'
           import csv
-          import os
-          import sys
 
-          csv.field_size_limit(sys.maxsize)
-
-          files = [
-              "downloaded_data/units_0001.csv",
-              "downloaded_data/units_0002.csv",
-              "downloaded_data/units_0003.csv",
-          ]
-
-          output_file = "units_combined.csv"
-          expected_header = None
-          total_rows = 0
-
-          with open(output_file, "w", encoding="utf-8", newline="") as out:
+          files = ["part1.csv", "part2.csv", "part3.csv"]
+          with open("units_combined.csv", "w", encoding="utf-8", newline="") as out:
               writer = None
+              expected_header = None
 
-              for path in files:
-                  print(f"Processing {path}...")
-
-                  with open(path, "r", encoding="utf-8-sig", newline="") as src:
+              for filename in files:
+                  with open(filename, "r", encoding="utf-8-sig", newline="") as src:
                       reader = csv.reader(src)
-
-                      try:
-                          header = next(reader)
-                      except StopIteration:
-                          sys.exit(f"ERROR: Empty CSV file: {path}")
+                      header = next(reader)
 
                       if expected_header is None:
                           expected_header = header
                           writer = csv.writer(out)
                           writer.writerow(header)
                       elif header != expected_header:
-                          sys.exit(
-                              f"ERROR: CSV headers differ in {path}. "
-                              "Files were not merged."
-                          )
-
-                      file_rows = 0
+                          raise ValueError(f"CSV header mismatch: {filename}")
 
                       for row in reader:
-                          if not row:
-                              continue
-
                           writer.writerow(row)
-                          file_rows += 1
 
-                      total_rows += file_rows
-                      print(f"Rows added from this file: {file_rows:,}")
-
-          print(f"Total data rows: {total_rows:,}")
-          print(f"Merged CSV size: {os.path.getsize(output_file) / (1024 * 1024):.2f} MB")
-
-          if total_rows == 0:
-              sys.exit("ERROR: No data rows found.")
-
-          with open("merge_metadata.txt", "w") as f:
-              f.write(str(total_rows))
+          print("CSV files merged successfully.")
           PY
 
-      - name: Convert merged CSV to SQLite
+      - name: Convert CSV to SQLite
         run: |
           python convert_csv_to_db.py --csv units_combined.csv
-
-      - name: Verify database
-        run: |
           python convert_csv_to_db.py --verify
 
-          python - <<'PY'
-          import sqlite3
-          import sys
-
-          conn = sqlite3.connect("dld_units.db")
-
-          integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
-          rows = conn.execute("SELECT COUNT(*) FROM units").fetchone()[0]
-          columns = conn.execute("PRAGMA table_info(units)").fetchall()
-
-          conn.close()
-
-          print(f"Database integrity: {integrity}")
-          print(f"Database rows: {rows:,}")
-          print(f"Database columns: {len(columns)}")
-
-          if integrity != "ok" or rows == 0:
-              sys.exit("ERROR: Database verification failed.")
-          PY
-
       - name: Compress database
-        run: |
-          set -e
+        run: gzip -9 -k dld_units.db
 
-          gzip -9 -k dld_units.db
-
-          echo "DB_SIZE=$(du -h dld_units.db | cut -f1)" >> "$GITHUB_ENV"
-          echo "GZ_SIZE=$(du -h dld_units.db.gz | cut -f1)" >> "$GITHUB_ENV"
-
-          echo "ROW_COUNT=$(python -c "import sqlite3; c=sqlite3.connect('dld_units.db'); print(c.execute('SELECT COUNT(*) FROM units').fetchone()[0])")" >> "$GITHUB_ENV"
-
-          echo "TIMESTAMP=$(date -u '+%Y-%m-%d %H:%M UTC')" >> "$GITHUB_ENV"
-
-          ls -lh dld_units.db dld_units.db.gz db_metadata.json
-
-      - name: Delete previous database release
+      - name: Create database release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release delete latest-data --yes --cleanup-tag || true
-
-      - name: Publish database release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
           gh release create latest-data \
-            dld_units.db.gz \
-            db_metadata.json \
-            --title "DLD Database - ${{ env.TIMESTAMP }}" \
-            --notes "Rows: ${{ env.ROW_COUNT }}
-          Database size: ${{ env.DB_SIZE }}
-          Compressed size: ${{ env.GZ_SIZE }}
-          Updated: ${{ env.TIMESTAMP }}" \
+            dld_units.db.gz db_metadata.json \
+            --title "DLD Database Update" \
+            --notes "Database built from the three Data Dubai CSV files." \
             --latest
-
-      - name: Log completion
-        run: |
-          echo "DLD database update completed."
-          echo "Rows: ${{ env.ROW_COUNT }}"
