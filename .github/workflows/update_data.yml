@@ -1,4 +1,3 @@
-
 name: Weekly DLD Data Update
 
 on:
@@ -25,17 +24,23 @@ jobs:
 
       - name: Install dependencies
         run: |
+          python -m pip install --upgrade pip
           pip install requests gdown
 
       - name: Download CSV files from Google Drive
         run: |
-          gdown "https://drive.google.com/file/d/1q9PXkwolIIlV9sRDsPG7_-nATw9dFkS4/view" -O part1.csv
-          gdown "https://drive.google.com/file/d/1Lz_HWONoC3G36JOHZM4bPLYJhDSxxcoL/view" -O part2.csv
-          gdown "https://drive.google.com/file/d/1-4Kn0QYc2RCy0QpMTfqwOCg8tpjJh_re/view" -O part3.csv
+          set -e
 
-          test "$(stat -c%s part1.csv)" -gt 300000000
-          test "$(stat -c%s part2.csv)" -gt 300000000
-          test "$(stat -c%s part3.csv)" -gt 300000000
+          gdown "https://drive.google.com/uc?id=1q9PXkwolIIlV9sRDsPG7_-nATw9dFkS4" -O part1.csv --retries 3
+          gdown "https://drive.google.com/uc?id=1Lz_HWONoC3G36JOHZM4bPLYJhDSxxcoL" -O part2.csv --retries 3
+          gdown "https://drive.google.com/uc?id=1-4Kn0QYc2RCy0QpMTfqwOCg8tpjJh_re" -O part3.csv --retries 3
+
+          for file in part1.csv part2.csv part3.csv; do
+            test -s "$file"
+            size=$(stat -c%s "$file")
+            echo "$file size: $size bytes"
+            test "$size" -gt 300000000
+          done
 
       - name: Merge CSV files
         run: |
@@ -43,43 +48,104 @@ jobs:
           import csv
 
           files = ["part1.csv", "part2.csv", "part3.csv"]
-          with open("units_combined.csv", "w", encoding="utf-8", newline="") as out:
+          output_file = "units_combined.csv"
+          expected_header = None
+          total_rows = 0
+
+          with open(output_file, "w", encoding="utf-8", newline="") as out:
               writer = None
-              expected_header = None
 
               for filename in files:
+                  print(f"Processing {filename}...")
+
                   with open(filename, "r", encoding="utf-8-sig", newline="") as src:
                       reader = csv.reader(src)
-                      header = next(reader)
+                      header = next(reader, None)
+
+                      if not header:
+                          raise ValueError(f"Empty CSV or missing header: {filename}")
 
                       if expected_header is None:
                           expected_header = header
                           writer = csv.writer(out)
                           writer.writerow(header)
                       elif header != expected_header:
-                          raise ValueError(f"CSV header mismatch: {filename}")
+                          raise ValueError(
+                              f"CSV headers do not match in {filename}. "
+                              "Cannot safely merge these files."
+                          )
 
+                      file_rows = 0
                       for row in reader:
-                          writer.writerow(row)
+                          if row:
+                              writer.writerow(row)
+                              file_rows += 1
 
-          print("CSV files merged successfully.")
+                      total_rows += file_rows
+                      print(f"{filename}: {file_rows:,} rows")
+
+          print(f"Merge complete: {total_rows:,} data rows")
+          print(f"Output: {output_file}")
           PY
 
       - name: Convert CSV to SQLite
         run: |
           python convert_csv_to_db.py --csv units_combined.csv
+
+      - name: Verify database
+        run: |
           python convert_csv_to_db.py --verify
 
-      - name: Compress database
-        run: gzip -9 -k dld_units.db
+          python - <<'PY'
+          import sqlite3
+          import os
 
-      - name: Create database release
+          db = "dld_units.db"
+
+          if not os.path.exists(db) or os.path.getsize(db) == 0:
+              raise SystemExit("Database missing or empty")
+
+          conn = sqlite3.connect(db)
+          integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
+          rows = conn.execute("SELECT COUNT(*) FROM units").fetchone()[0]
+          columns = conn.execute("PRAGMA table_info(units)").fetchall()
+          conn.close()
+
+          print(f"Integrity: {integrity}")
+          print(f"Rows: {rows:,}")
+          print(f"Columns: {len(columns)}")
+
+          if integrity != "ok" or rows == 0:
+              raise SystemExit("Database verification failed")
+          PY
+
+      - name: Compress database
+        run: |
+          gzip -9 -k dld_units.db
+
+          echo "DB_SIZE=$(du -h dld_units.db | cut -f1)" >> "$GITHUB_ENV"
+          echo "GZ_SIZE=$(du -h dld_units.db.gz | cut -f1)" >> "$GITHUB_ENV"
+          echo "ROW_COUNT=$(python -c "import sqlite3; c=sqlite3.connect('dld_units.db'); print(c.execute('SELECT COUNT(*) FROM units').fetchone()[0])")" >> "$GITHUB_ENV"
+          echo "TIMESTAMP=$(date -u '+%Y-%m-%d %H:%M UTC')" >> "$GITHUB_ENV"
+
+      - name: Delete previous database release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release delete latest-data --yes --cleanup-tag || true
+
+      - name: Publish database release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
           gh release create latest-data \
-            dld_units.db.gz db_metadata.json \
-            --title "DLD Database Update" \
-            --notes "Database built from the three Data Dubai CSV files." \
+            dld_units.db.gz \
+            db_metadata.json \
+            --title "DLD Database - ${{ env.TIMESTAMP }}" \
+            --notes "Rows: ${{ env.ROW_COUNT }} | Database: ${{ env.DB_SIZE }} | Compressed: ${{ env.GZ_SIZE }} | Updated: ${{ env.TIMESTAMP }}" \
             --latest
+
+      - name: Confirm completion
+        run: |
+          echo "Database update completed successfully."
+          echo "Rows: ${{ env.ROW_COUNT }}"
