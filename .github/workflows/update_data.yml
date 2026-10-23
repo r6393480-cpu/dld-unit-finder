@@ -29,9 +29,9 @@ jobs:
 
       - name: Download CSV files from Google Drive
         run: |
-          gdown --fuzzy "https://drive.google.com/file/d/1q9PXkwolIIlV9sRDsPG7_-nATw9dFkS4/view" -O part1.csv
-          gdown --fuzzy "https://drive.google.com/file/d/1Lz_HWONoC3G36JOHZM4bPLYJhDSxxcoL/view" -O part2.csv
-          gdown --fuzzy "https://drive.google.com/file/d/1-4Kn0QYc2RCy0QpMTfqwOCg8tpjJh_re/view" -O part3.csv
+          gdown "https://drive.google.com/file/d/1q9PXkwolIIlV9sRDsPG7_-nATw9dFkS4/view" -O part1.csv
+          gdown "https://drive.google.com/file/d/1Lz_HWONoC3G36JOHZM4bPLYJhDSxxcoL/view" -O part2.csv
+          gdown "https://drive.google.com/file/d/1-4Kn0QYc2RCy0QpMTfqwOCg8tpjJh_re/view" -O part3.csv
 
           test "$(stat -c%s part1.csv)" -gt 300000000
           test "$(stat -c%s part2.csv)" -gt 300000000
