@@ -1,16 +1,13 @@
-# .github/workflows/update_data.yml
-# Downloads DLD data weekly, converts to SQLite, compresses, uploads as GitHub Release
 
 name: Weekly DLD Data Update
 
 on:
   schedule:
-    # Every Sunday at 3:00 AM UTC
     - cron: '0 3 * * 0'
-  workflow_dispatch:  # Manual trigger button
+  workflow_dispatch:
 
 permissions:
-  contents: write  # Needed to create releases
+  contents: write
 
 jobs:
   update-data:
@@ -46,43 +43,28 @@ jobs:
 
       - name: Compress database
         run: |
-          echo "📦 Compressing database..."
           ls -lh dld_units.db
           gzip -9 -k dld_units.db
-          ls -lh dld_units.db.gz
           echo "DB_SIZE=$(du -h dld_units.db | cut -f1)" >> $GITHUB_ENV
           echo "GZ_SIZE=$(du -h dld_units.db.gz | cut -f1)" >> $GITHUB_ENV
           echo "ROW_COUNT=$(python3 -c "import sqlite3; c=sqlite3.connect('dld_units.db'); print(c.execute('SELECT COUNT(*) FROM units').fetchone()[0])")" >> $GITHUB_ENV
           echo "TIMESTAMP=$(date -u '+%Y-%m-%d %H:%M UTC')" >> $GITHUB_ENV
 
-      - name: Delete old release (if exists)
-        run: |
-          gh release delete latest-data --yes --cleanup-tag || true
+      - name: Delete old release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release delete latest-data --yes --cleanup-tag || true
 
       - name: Create new release with database
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release create latest-data \
             dld_units.db.gz \
             db_metadata.json \
             --title "DLD Database - ${{ env.TIMESTAMP }}" \
-            --notes "🏠 **DLD Unit Database Auto-Update**
-
-          📊 **Stats:**
-          - Rows: ${{ env.ROW_COUNT }}
-          - Columns: 46 (all preserved)
-          - DB size: ${{ env.DB_SIZE }}
-          - Compressed: ${{ env.GZ_SIZE }}
-          - Updated: ${{ env.TIMESTAMP }}
-
-          📥 Download \`dld_units.db.gz\` and decompress with \`gunzip\`" \
+            --notes "Rows: ${{ env.ROW_COUNT }}; DB size: ${{ env.DB_SIZE }}; Compressed: ${{ env.GZ_SIZE }}; Updated: ${{ env.TIMESTAMP }}" \
             --latest
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Log completion
-        run: |
-          echo "✅ Data update completed at $(date)"
-          echo "Database: ${{ env.DB_SIZE }} → ${{ env.GZ_SIZE }} compressed"
-          echo "Rows: ${{ env.ROW_COUNT }}"
+        run: echo "Database update completed."
