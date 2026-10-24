@@ -1,9 +1,9 @@
 import os
 import re
-import time
 import gzip
 import shutil
 import sqlite3
+import time
 from difflib import SequenceMatcher
 from urllib.parse import urlparse
 
@@ -12,9 +12,9 @@ import streamlit as st
 from bs4 import BeautifulSoup
 
 
-# =========================================================
-# CONFIGURATION
-# =========================================================
+# =====================================================
+# CONFIG
+# =====================================================
 
 st.set_page_config(
     page_title="DLD Unit Finder",
@@ -23,79 +23,42 @@ st.set_page_config(
 )
 
 DB_PATH = "dld_units.db"
-DB_GZ_PATH = "dld_units.db.gz"
+GZ_PATH = "dld_units.db.gz"
 RELEASE_TAG = "latest-data"
 
-GITHUB_REPO = os.environ.get(
-    "GITHUB_REPO",
-    st.secrets.get("GITHUB_REPO", "r6393480-cpu/dld-unit-finder")
-)
+GITHUB_REPO = os.environ.get("GITHUB_REPO", "")
 
-GITHUB_TOKEN = os.environ.get(
-    "GITHUB_TOKEN",
-    st.secrets.get("GITHUB_TOKEN", "")
-)
+if not GITHUB_REPO:
+    try:
+        GITHUB_REPO = st.secrets.get(
+            "GITHUB_REPO",
+            "r6393480-cpu/dld-unit-finder",
+        )
+    except Exception:
+        GITHUB_REPO = "r6393480-cpu/dld-unit-finder"
 
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 
-# =========================================================
-# STYLING
-# =========================================================
-
-st.markdown("""
-<style>
-.main-title {
-    text-align: center;
-    font-size: 32px;
-    font-weight: 800;
-    margin-bottom: 5px;
-}
-.subtitle {
-    text-align: center;
-    color: #777;
-    margin-bottom: 25px;
-}
-.result-card {
-    border: 1px solid #dddddd;
-    border-radius: 12px;
-    padding: 18px;
-    margin-top: 15px;
-}
-.unit-number {
-    font-size: 38px;
-    font-weight: 800;
-}
-.small-label {
-    color: #777;
-    font-size: 13px;
-}
-</style>
-""", unsafe_allow_html=True)
-
-st.markdown(
-    '<div class="main-title">🏠 DLD Unit Finder</div>',
-    unsafe_allow_html=True,
-)
-st.markdown(
-    '<div class="subtitle">Property Finder URL → DLD unit details</div>',
-    unsafe_allow_html=True,
-)
+if not GITHUB_TOKEN:
+    try:
+        GITHUB_TOKEN = st.secrets.get("GITHUB_TOKEN", "")
+    except Exception:
+        GITHUB_TOKEN = ""
 
 
-# =========================================================
+st.title("🏠 DLD Unit Finder")
+st.caption("Property Finder listing → DLD unit record")
+
+
+# =====================================================
 # DATABASE DOWNLOAD
-# =========================================================
+# =====================================================
 
 def download_database(force=False):
-    """Download and validate SQLite database from GitHub Releases."""
+    if os.path.exists(DB_PATH) and not force:
+        age = time.time() - os.path.getmtime(DB_PATH)
 
-    if (
-        not force
-        and os.path.exists(DB_PATH)
-        and os.path.getsize(DB_PATH) > 0
-    ):
-        age_hours = (time.time() - os.path.getmtime(DB_PATH)) / 3600
-
-        if age_hours < 24:
+        if age < 24 * 60 * 60:
             return True
 
     headers = {
@@ -117,25 +80,17 @@ def download_database(force=False):
             headers=headers,
             timeout=30,
         )
-
-        if response.status_code != 200:
-            st.error(
-                f"GitHub Release access failed "
-                f"(HTTP {response.status_code}). "
-                f"Check GITHUB_REPO and the latest-data release."
-            )
-            return False
+        response.raise_for_status()
 
         release = response.json()
-
-        asset_url = None
+        download_url = None
 
         for asset in release.get("assets", []):
-            if asset.get("name") == "dld_units.db.gz":
-                asset_url = asset.get("browser_download_url")
+            if asset["name"] == "dld_units.db.gz":
+                download_url = asset["browser_download_url"]
                 break
 
-        if not asset_url:
+        if not download_url:
             st.error(
                 "Release mein dld_units.db.gz file nahi mili."
             )
@@ -143,64 +98,52 @@ def download_database(force=False):
 
         with st.spinner("Downloading DLD database..."):
             response = requests.get(
-                asset_url,
+                download_url,
                 headers=headers,
                 stream=True,
                 timeout=(30, 600),
             )
             response.raise_for_status()
 
-            with open(DB_GZ_PATH, "wb") as file:
+            with open(GZ_PATH, "wb") as file:
                 for chunk in response.iter_content(
                     chunk_size=1024 * 1024
                 ):
                     if chunk:
                         file.write(chunk)
 
-            with gzip.open(DB_GZ_PATH, "rb") as source:
+            with gzip.open(GZ_PATH, "rb") as source:
                 with open(DB_PATH, "wb") as destination:
                     shutil.copyfileobj(source, destination)
 
-        # Validate SQLite database
         connection = sqlite3.connect(DB_PATH)
 
-        try:
-            tables = connection.execute(
-                "SELECT name FROM sqlite_master "
-                "WHERE type='table'"
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
             ).fetchall()
+        }
 
-            if not any(row[0] == "units" for row in tables):
-                raise ValueError(
-                    "Database mein required 'units' table nahi hai."
-                )
+        connection.close()
 
-            connection.execute("PRAGMA schema_version").fetchone()
+        if "units" not in tables:
+            raise ValueError(
+                "Database mein 'units' table nahi mili."
+            )
 
-        finally:
-            connection.close()
-
-        if os.path.exists(DB_GZ_PATH):
-            os.remove(DB_GZ_PATH)
+        if os.path.exists(GZ_PATH):
+            os.remove(GZ_PATH)
 
         return True
 
     except Exception as error:
-        for path in (DB_GZ_PATH,):
-            if os.path.exists(path):
-                try:
-                    os.remove(path)
-                except OSError:
-                    pass
-
         st.error(f"Database download failed: {error}")
         return False
 
 
 @st.cache_resource
 def get_db():
-    """Open the SQLite database."""
-
     if not os.path.exists(DB_PATH):
         return None
 
@@ -222,45 +165,104 @@ def get_columns(connection):
     }
 
 
-# =========================================================
-# PROPERTY FINDER URL PARSER
-# =========================================================
+# =====================================================
+# TEXT UTILITIES
+# =====================================================
+
+def normalize(value):
+    if value is None:
+        return ""
+
+    value = str(value).lower()
+    value = re.sub(r"[^a-z0-9\s.]", " ", value)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def get_value(row, names):
+    available = {key.lower(): key for key in row.keys()}
+
+    for name in names:
+        actual = available.get(name.lower())
+
+        if actual is not None:
+            return row[actual]
+
+    return None
+
+
+def similarity(a, b):
+    a = normalize(a)
+    b = normalize(b)
+
+    if not a or not b:
+        return 0.0
+
+    if a == b:
+        return 1.0
+
+    return SequenceMatcher(None, a, b).ratio()
+
+
+def parse_number(value):
+    if value is None:
+        return None
+
+    match = re.search(
+        r"\d+(?:,\d{3})*(?:\.\d+)?",
+        str(value),
+    )
+
+    if not match:
+        return None
+
+    try:
+        return float(match.group(0).replace(",", ""))
+    except ValueError:
+        return None
+
+
+def parse_bedrooms(value):
+    if value is None:
+        return None
+
+    text = normalize(value)
+
+    if "studio" in text:
+        return 0
+
+    number = parse_number(text)
+
+    if number is None:
+        return None
+
+    return int(number)
+
+
+# =====================================================
+# PROPERTY FINDER URL
+# =====================================================
 
 def parse_pf_url(url):
-    """
-    Extract project candidates and location from a Property Finder URL.
-
-    Example:
-    apartment-for-sale-dubai-dubai-silicon-oasis-serenova-163243433.html
-
-    Project candidate: serenova
-    Location context: silicon oasis
-    """
-
-    data = {
+    result = {
         "source_url": url,
         "project_candidates": [],
         "location": "",
         "property_type": "",
-        "listing_id": "",
         "title": "",
         "bedrooms": None,
         "area_sqft": None,
     }
 
     parsed = urlparse(url)
-
     slug = parsed.path.rstrip("/").split("/")[-1]
-    slug = re.sub(r"\.html?$", "", slug, flags=re.IGNORECASE)
+    slug = re.sub(r"\.html?$", "", slug, flags=re.I)
 
     parts = slug.lower().split("-")
 
-    # Remove the listing ID at the end.
     if parts and parts[-1].isdigit():
-        data["listing_id"] = parts[-1]
         parts = parts[:-1]
 
-    property_types = {
+    types = {
         "apartment": "Apartment",
         "villa": "Villa",
         "townhouse": "Townhouse",
@@ -269,57 +271,45 @@ def parse_pf_url(url):
         "studio": "Studio",
     }
 
-    for part in parts:
-        if part in property_types:
-            data["property_type"] = property_types[part]
+    for word in parts:
+        if word in types:
+            result["property_type"] = types[word]
             break
 
-    # Find the location after the sale/rent segment.
-    marker_index = -1
+    start = None
 
-    for i in range(len(parts) - 1):
-        if parts[i] == "for" and parts[i + 1] in (
-            "sale", "rent", "buy", "lease"
+    for index in range(len(parts) - 1):
+        if (
+            parts[index] == "for"
+            and parts[index + 1] in {"sale", "rent", "buy", "lease"}
         ):
-            marker_index = i + 2
+            start = index + 2
             break
 
-    location_parts = []
+    if start is None:
+        return result
 
-    if marker_index >= 0:
-        remaining = parts[marker_index:]
+    location_parts = parts[start:]
 
-        if "dubai" in remaining:
-            dubai_index = remaining.index("dubai")
-            location_parts = remaining[dubai_index + 1:]
+    if "dubai" in location_parts:
+        location_parts = location_parts[
+            location_parts.index("dubai") + 1:
+        ]
 
-            # Remove repeated "dubai" in URL slugs.
-            location_parts = [
-                word for word in location_parts
-                if word != "dubai"
-            ]
-
-    # Keep only meaningful URL location information.
-    data["location"] = " ".join(location_parts)
-
-    # Candidate projects are generated from the END of the slug.
-    # This prioritizes names like "serenova" over "silicon oasis".
-    stop_words = {
-        "for", "sale", "rent", "buy", "lease",
-        "apartment", "villa", "townhouse", "penthouse",
-        "duplex", "studio", "bedroom", "bedrooms",
-    }
-
-    clean = [
+    location_parts = [
         word for word in location_parts
-        if word not in stop_words
+        if word != "dubai"
     ]
 
+    result["location"] = " ".join(location_parts)
+
+    # Generate candidate names from the end of the URL slug.
+    # For this listing, "serenova" is the most specific candidate.
     candidates = []
 
-    for count in range(1, min(5, len(clean) + 1)):
-        project = " ".join(clean[-count:])
-        context = " ".join(clean[:-count])
+    for count in range(1, min(5, len(location_parts) + 1)):
+        project = " ".join(location_parts[-count:])
+        context = " ".join(location_parts[:-count])
 
         if project:
             candidates.append({
@@ -327,18 +317,16 @@ def parse_pf_url(url):
                 "context": context,
             })
 
-    data["project_candidates"] = candidates
+    result["project_candidates"] = candidates
 
-    return data
+    return result
 
 
-# =========================================================
-# PROPERTY PAGE SCRAPER
-# =========================================================
+# =====================================================
+# SCRAPE LISTING DETAILS
+# =====================================================
 
 def scrape_pf_page(url):
-    """Attempt to retrieve listing title, bedrooms and area."""
-
     result = {
         "title": "",
         "bedrooms": None,
@@ -348,8 +336,7 @@ def scrape_pf_page(url):
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/132.0.0.0 Safari/537.36"
+            "AppleWebKit/537.36 Chrome/132.0 Safari/537.36"
         ),
         "Accept-Language": "en-US,en;q=0.9",
     }
@@ -366,10 +353,10 @@ def scrape_pf_page(url):
 
         soup = BeautifulSoup(response.text, "html.parser")
 
-        title_tag = soup.find("meta", property="og:title")
+        title = soup.find("meta", property="og:title")
 
-        if title_tag:
-            result["title"] = title_tag.get("content", "")
+        if title:
+            result["title"] = title.get("content", "")
 
         if not result["title"] and soup.title:
             result["title"] = soup.title.get_text(" ", strip=True)
@@ -379,7 +366,7 @@ def scrape_pf_page(url):
         bedroom_match = re.search(
             r"\b(\d{1,2})\s*(?:bedrooms?|beds|br)\b",
             text,
-            re.IGNORECASE,
+            re.I,
         )
 
         if bedroom_match:
@@ -388,7 +375,7 @@ def scrape_pf_page(url):
         area_match = re.search(
             r"([\d,]+(?:\.\d+)?)\s*(?:sq\.?\s*ft|sqft|square feet)\b",
             text,
-            re.IGNORECASE,
+            re.I,
         )
 
         if area_match:
@@ -397,61 +384,16 @@ def scrape_pf_page(url):
             )
 
     except Exception:
-        # Property Finder may block automated requests.
         pass
 
     return result
 
 
-# =========================================================
-# NORMALIZATION AND SCORING
-# =========================================================
+# =====================================================
+# MATCH SCORING
+# =====================================================
 
-def normalize(value):
-    if value is None:
-        return ""
-
-    value = str(value).lower()
-    value = re.sub(r"[^a-z0-9\s]", " ", value)
-    value = re.sub(r"\s+", " ", value).strip()
-
-    return value
-
-
-def similarity(a, b):
-    a = normalize(a)
-    b = normalize(b)
-
-    if not a or not b:
-        return 0.0
-
-    if a == b:
-        return 1.0
-
-    return SequenceMatcher(None, a, b).ratio()
-
-
-def get_value(row, possible_names):
-    """Read a field even if the database uses slightly different names."""
-
-    available = {key.lower(): key for key in row.keys()}
-
-    for name in possible_names:
-        actual_name = available.get(name.lower())
-
-        if actual_name:
-            return row[actual_name]
-
-    return None
-
-
-def score_row(row, prop):
-    """
-    Score a DLD record using project, location and available listing details.
-
-    The score is a ranking score, not a statistically calibrated probability.
-    """
-
+def score_record(row, prop):
     project_name = normalize(
         get_value(row, ["project_name_en", "project_name"])
     )
@@ -464,179 +406,149 @@ def score_row(row, prop):
         get_value(row, ["area_name_en", "area_name"])
     )
 
-    row_type = normalize(
-        get_value(row, ["property_type_en", "property_type", "property_type_name"])
-    )
-
-    row_bedrooms = get_value(
-        row,
-        ["rooms", "bedrooms", "room_count"],
-    )
-
-    row_area = get_value(
-        row,
-        ["actual_area", "area_sqft", "unit_area"],
-    )
-
+    score = 0.0
     best_project_score = 0.0
     best_context_score = 0.0
 
-    for candidate in prop.get("project_candidates", []):
-        candidate_name = normalize(candidate["project"])
+    for candidate in prop["project_candidates"]:
+        project = normalize(candidate["project"])
         context = normalize(candidate["context"])
 
-        # Project match is the primary signal.
-        if candidate_name:
-            exact = candidate_name == project_name
+        if not project:
+            continue
 
-            contains = (
-                candidate_name in project_name
-                or project_name in candidate_name
-            )
+        # Project name is the most important signal.
+        if project == project_name:
+            project_score = 100
+        elif project in project_name or project_name in project:
+            project_score = 85
+        else:
+            project_score = similarity(
+                project,
+                project_name,
+            ) * 60
 
-            if exact:
-                current_score = 100.0
-            elif contains:
-                current_score = 85.0
-            else:
-                current_score = (
-                    similarity(candidate_name, project_name) * 60
-                )
+        # Avoid treating a single generic word as an exact project.
+        if len(project.split()) == 1 and project != project_name:
+            project_score = min(project_score, 65)
 
-            # A single generic word is not enough for high confidence.
-            if len(candidate_name.split()) == 1:
-                current_score = min(current_score, 65.0)
+        best_project_score = max(
+            best_project_score,
+            project_score,
+        )
 
-            best_project_score = max(
-                best_project_score,
-                current_score,
-            )
-
-        # Location context helps separate projects in different areas.
+        # Location is supporting evidence, not the main project match.
         if context:
-            context_matches = (
-                context in area_name
-                or context in master_project
-                or area_name in context
-            )
+            context_words = [
+                word for word in context.split()
+                if len(word) > 2
+            ]
 
-            if context_matches:
-                best_context_score = max(
-                    best_context_score,
-                    20.0,
-                )
-            else:
-                context_words = [
-                    word for word in context.split()
-                    if len(word) > 2
-                ]
-
-                matching_words = sum(
+            if context_words:
+                matched = sum(
                     1 for word in context_words
                     if word in area_name or word in master_project
                 )
 
-                if context_words:
-                    best_context_score = max(
-                        best_context_score,
-                        15.0 * matching_words / len(context_words),
-                    )
+                context_score = 15 * matched / len(context_words)
 
-    score = best_project_score + best_context_score
+                best_context_score = max(
+                    best_context_score,
+                    context_score,
+                )
 
-    # Additional details are useful only if the page was successfully scraped.
-    prop_type = normalize(prop.get("property_type"))
+    score += best_project_score
+    score += best_context_score
 
-    if prop_type and row_type:
-        if prop_type in row_type or row_type in prop_type:
+    # Property type check.
+    row_type = normalize(
+        get_value(
+            row,
+            ["property_type_en", "property_type", "property_type_name"],
+        )
+    )
+
+    requested_type = normalize(prop.get("property_type"))
+
+    if row_type and requested_type:
+        if requested_type in row_type or row_type in requested_type:
             score += 8
         else:
             score -= 8
 
-    if prop.get("bedrooms") is not None and row_bedrooms is not None:
-        try:
-            if int(float(row_bedrooms)) == int(prop["bedrooms"]):
-                score += 10
-            else:
-                score -= 10
-        except (ValueError, TypeError):
-            pass
+    # Bedroom count check.
+    row_bedrooms = parse_bedrooms(
+        get_value(row, ["rooms", "bedrooms", "room_count"])
+    )
 
-    if prop.get("area_sqft") is not None and row_area is not None:
-        try:
-            listing_area = float(prop["area_sqft"])
-            database_area = float(
-                str(row_area).replace(",", "")
-            )
+    requested_bedrooms = prop.get("bedrooms")
 
-            if listing_area > 0 and database_area > 0:
-                difference = (
-                    abs(listing_area - database_area) / listing_area
-                )
+    if (
+        requested_bedrooms is not None
+        and row_bedrooms is not None
+    ):
+        if row_bedrooms == int(requested_bedrooms):
+            score += 20
+        else:
+            score -= 20
 
-                if difference <= 0.05:
-                    score += 15
-                elif difference <= 0.15:
-                    score += 10
-                elif difference <= 0.30:
-                    score += 3
-                else:
-                    score -= 5
+    # Area check: reward a close match to 1231 sqft.
+    row_area = parse_number(
+        get_value(
+            row,
+            ["actual_area", "area_sqft", "unit_area"],
+        )
+    )
 
-        except (ValueError, TypeError):
-            pass
+    requested_area = prop.get("area_sqft")
+
+    if (
+        requested_area is not None
+        and row_area is not None
+        and requested_area > 0
+        and row_area > 0
+    ):
+        difference = abs(row_area - requested_area) / requested_area
+
+        if difference <= 0.02:
+            score += 30
+        elif difference <= 0.05:
+            score += 25
+        elif difference <= 0.10:
+            score += 15
+        elif difference <= 0.15:
+            score += 5
+        else:
+            score -= 10
 
     return round(score, 2)
 
 
-# =========================================================
-# SEARCH DATABASE
-# =========================================================
+# =====================================================
+# DATABASE SEARCH
+# =====================================================
 
-def find_units(connection, prop):
-    """
-    Search for likely records and return only one strong result.
-
-    Important: if the data does not support a reliable match, return no result
-    rather than selecting a random unit.
-    """
-
+def find_best_match(connection, prop):
     columns = get_columns(connection)
 
-    required_columns = {
-        "project_name_en",
-        "unit_number",
-    }
-
-    if not required_columns.issubset(columns):
+    if "project_name_en" not in columns:
         st.error(
-            "Database schema expected columns nahi rakhta. "
-            "Check karein ke correct DLD database download hui hai."
+            "Database mein project_name_en column nahi mila."
         )
         return None
 
-    candidates = prop.get("project_candidates", [])
+    candidates = prop["project_candidates"]
 
     if not candidates:
         return None
 
-    rows_by_key = {}
+    records = {}
 
-    # Search the most specific project candidates first.
+    # Search the specific project name first, then broader candidates.
     for candidate in candidates:
         project = normalize(candidate["project"])
 
         if len(project) < 3:
-            continue
-
-        # Avoid generic one-word matches.
-        generic_words = {
-            "residence", "residences", "tower", "towers",
-            "building", "garden", "gardens", "park",
-            "view", "views", "city", "bay", "heights",
-        }
-
-        if len(project.split()) == 1 and project in generic_words:
             continue
 
         escaped = (
@@ -645,60 +557,65 @@ def find_units(connection, prop):
             .replace("_", "\\_")
         )
 
-        query = """
+        sql = """
             SELECT *
             FROM units
-            WHERE LOWER(COALESCE(project_name_en, '')) LIKE ? ESCAPE '\\'
-               OR LOWER(COALESCE(master_project_en, '')) LIKE ? ESCAPE '\\'
-            LIMIT 1500
+            WHERE LOWER(COALESCE(project_name_en, ''))
+                  LIKE ? ESCAPE '\\'
         """
 
+        params = [f"%{escaped}%"]
+
+        if "master_project_en" in columns:
+            sql += """
+                OR LOWER(COALESCE(master_project_en, ''))
+                   LIKE ? ESCAPE '\\'
+            """
+            params.append(f"%{escaped}%")
+
+        sql += " LIMIT 3000"
+
         try:
-            rows = connection.execute(
-                query,
-                (f"%{escaped}%", f"%{escaped}%"),
+            found = connection.execute(
+                sql,
+                params,
             ).fetchall()
         except sqlite3.Error as error:
-            st.error(f"Database search error: {error}")
+            st.error(f"Database query failed: {error}")
             return None
 
-        for row in rows:
+        for row in found:
             key = (
                 str(get_value(row, ["unit_number"]) or ""),
                 str(get_value(row, ["land_number"]) or ""),
                 str(get_value(row, ["project_name_en"]) or ""),
-                str(get_value(row, ["master_project_en"]) or ""),
             )
 
-            rows_by_key[key] = row
+            records[key] = row
 
-        # Do not stop after the first weak candidate.
-        # Broader candidates can produce useful records too.
-
-    if not rows_by_key:
+    if not records:
         return None
 
     ranked = []
 
-    for row in rows_by_key.values():
-        score = score_row(row, prop)
+    for row in records.values():
+        score = score_record(row, prop)
         ranked.append((score, row))
 
     ranked.sort(key=lambda item: item[0], reverse=True)
 
     best_score, best_row = ranked[0]
 
-    # Prevent weak results from being presented as accurate matches.
-    # The threshold is a conservative ranking rule, not a probability.
+    # A weak project match must not be shown as a reliable result.
     if best_score < 75:
         return None
 
-    # If the top records have nearly identical scores but different units,
-    # the app cannot safely claim the first one is uniquely correct.
+    # If the second record is almost equally good, check whether
+    # it points to a different unit.
     if len(ranked) > 1:
         second_score, second_row = ranked[1]
 
-        first_unit = str(
+        best_unit = str(
             get_value(best_row, ["unit_number"]) or ""
         )
 
@@ -706,13 +623,16 @@ def find_units(connection, prop):
             get_value(second_row, ["unit_number"]) or ""
         )
 
+        # Ambiguity is only meaningful if different units have
+        # nearly equal scores. If the scores differ enough, show the top.
         if (
-            first_unit != second_unit
+            best_unit != second_unit
             and best_score - second_score < 5
         ):
             return {
                 "ambiguous": True,
                 "best_score": best_score,
+                "row": best_row,
                 "second_score": second_score,
             }
 
@@ -723,134 +643,126 @@ def find_units(connection, prop):
     }
 
 
-# =========================================================
-# DISPLAY RESULT
-# =========================================================
+# =====================================================
+# DISPLAY
+# =====================================================
 
-def show_result(result):
+def display_result(result):
     if result is None:
         st.warning(
-            "Reliable match nahi mila. Project DLD database mein "
-            "registered na ho, ya listing details insufficient ho sakti hain."
+            "Reliable match nahi mila. Database mein project ke records "
+            "hona aur exact listing unit identify hona alag cheezein hain."
         )
         return
 
-    if result.get("ambiguous"):
+    if result["ambiguous"]:
         st.warning(
-            "Is listing ke liye multiple similar records mil rahe hain. "
-            "Sirf ek unit ko accurate kehna reliable nahi hoga. "
-            "Listing ka exact area aur bedroom count verify karein."
+            "Multiple units ke scores bahut close hain. "
+            "App ek record ko confirmed unit nahi keh sakti."
         )
+
+        st.write(
+            "**Top candidate score:**",
+            result["best_score"],
+        )
+
+        st.write(
+            "**Second candidate score:**",
+            result["second_score"],
+        )
+
+        with st.expander("Inspect top candidate"):
+            st.json(dict(result["row"]))
+
         return
 
     row = result["row"]
-    score = result["score"]
 
-    unit_number = get_value(row, ["unit_number"])
-    project_name = get_value(row, ["project_name_en"])
-    master_project = get_value(row, ["master_project_en"])
-    area_name = get_value(row, ["area_name_en"])
-    land_number = get_value(row, ["land_number"])
+    unit = get_value(row, ["unit_number"])
+    project = get_value(row, ["project_name_en"])
+    master = get_value(row, ["master_project_en"])
+    area = get_value(row, ["area_name_en"])
+    land = get_value(row, ["land_number"])
 
-    st.success("Best matching DLD record")
+    st.success("Top matching DLD record")
 
-    st.markdown(
-        f'<div class="result-card">'
-        f'<div class="small-label">UNIT NUMBER</div>'
-        f'<div class="unit-number">{unit_number or "N/A"}</div>'
-        f'</div>',
-        unsafe_allow_html=True,
+    st.metric(
+        "Unit Number",
+        str(unit) if unit is not None else "N/A",
     )
 
-    st.write(f"**Project:** {project_name or 'N/A'}")
-    st.write(f"**Master Project:** {master_project or 'N/A'}")
-    st.write(f"**Area:** {area_name or 'N/A'}")
-    st.write(f"**Land Number:** {land_number or 'N/A'}")
+    st.write("**Project:**", project or "N/A")
+    st.write("**Master project:**", master or "N/A")
+    st.write("**Area:**", area or "N/A")
+    st.write("**Land number:**", land or "N/A")
 
     st.caption(
-        f"Internal match score: {score}. "
-        "Yeh probability percentage nahi hai."
+        f"Match score: {result['score']} "
+        "(ranking score, probability nahi)."
     )
 
-    with st.expander("View all DLD fields"):
+    with st.expander("All DLD fields"):
         st.json(dict(row))
 
 
-# =========================================================
+# =====================================================
 # SIDEBAR
-# =========================================================
+# =====================================================
 
 with st.sidebar:
-    st.header("⚙️ Settings")
+    st.subheader("Settings")
+    st.caption(f"Repository: {GITHUB_REPO}")
 
-    st.caption(f"Database repository: {GITHUB_REPO}")
-
-    if st.button("🔄 Update Database", use_container_width=True):
+    if st.button("🔄 Update database"):
         if download_database(force=True):
             get_db.clear()
-            st.success("Database updated successfully.")
+            st.success("Database updated.")
             st.rerun()
 
-    st.divider()
 
-    st.caption(
-        "Data source: DLD open data. "
-        "Some off-plan properties may not be registered."
-    )
-
-
-# =========================================================
-# MAIN SEARCH
-# =========================================================
+# =====================================================
+# MAIN
+# =====================================================
 
 url = st.text_input(
-    "Property Finder listing URL",
-    placeholder="https://www.propertyfinder.ae/en/plp/...",
+    "Property Finder URL",
+    placeholder="Paste listing URL here",
 )
 
-search_button = st.button(
-    "🔍 Find Unit",
-    type="primary",
-    use_container_width=True,
-)
-
-if search_button:
+if st.button("Find Unit", type="primary", use_container_width=True):
     if not url.strip():
-        st.warning("Pehle Property Finder URL enter karein.")
+        st.warning("Property Finder URL enter karein.")
 
     elif "propertyfinder.ae" not in urlparse(url).netloc.lower():
-        st.warning("Please enter a valid Property Finder URL.")
+        st.warning("Valid Property Finder URL enter karein.")
 
-    else:
-        if download_database():
-            connection = get_db()
+    elif download_database():
+        connection = get_db()
 
-            if connection is None:
-                st.error("Database open nahi ho saki.")
-            else:
-                with st.spinner("Listing details aur DLD records check ho rahe hain..."):
-                    prop = parse_pf_url(url)
+        if connection is None:
+            st.error("Database open nahi ho saki.")
+        else:
+            with st.spinner("Searching DLD records..."):
+                prop = parse_pf_url(url)
+                scraped = scrape_pf_page(url)
 
-                    scraped = scrape_pf_page(url)
-                    prop.update(scraped)
+                # Only overwrite fields if scraping found real values.
+                for key, value in scraped.items():
+                    if value not in (None, ""):
+                        prop[key] = value
 
-                    # Search only after extracting the available details.
-                    result = find_units(connection, prop)
+                result = find_best_match(connection, prop)
 
-                st.divider()
+            with st.expander("Extracted listing details"):
+                st.write(
+                    "**Project candidates:**",
+                    [x["project"] for x in prop["project_candidates"]],
+                )
+                st.write("**Location:**", prop["location"])
+                st.write("**Property type:**", prop["property_type"])
+                st.write("**Listing title:**", prop["title"] or "Unavailable")
+                st.write("**Bedrooms:**", prop["bedrooms"] or "Unavailable")
+                st.write("**Area (sq ft):**", prop["area_sqft"] or "Unavailable")
 
-                with st.expander("Extracted listing details"):
-                    st.write(
-                        "**Project candidates:**",
-                        [
-                            candidate["project"]
-                            for candidate in prop["project_candidates"]
-                        ],
-                    )
-                    st.write("**URL location:**", prop.get("location"))
-                    st.write("**Property type:**", prop.get("property_type"))
-                    st.write("**Listing title:**", prop.get("title") or "Not available")
-                    st.write("**Bedrooms:**", prop.get("bedrooms") or "Not available")
-                    st.write("**Area (sq ft):**", prop.get("area_sqft") or "Not available")
-
-                show_result(result)
+            st.divider()
+            display_result(result)
