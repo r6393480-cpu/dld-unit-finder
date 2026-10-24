@@ -1,586 +1,676 @@
-
-import gzip
 import os
 import re
+import gzip
+import json
+import shutil
 import sqlite3
 import tempfile
-from urllib.parse import urlparse
-
 import requests
 import streamlit as st
+
+from pathlib import Path
+from urllib.parse import urlparse
 from bs4 import BeautifulSoup
 
+=========================================================
 
-# --------------------------------------------------
-# CONFIGURATION
-# --------------------------------------------------
+CONFIGURATION
+
+=========================================================
 
 st.set_page_config(
-    page_title="Dubai DLD Unit Finder",
-    page_icon="🏢",
-    layout="centered",
+page_title=“Dubai DLD Unit Finder”,
+page_icon=“🏢”,
+layout=“wide”,
+)
+
+GITHUB_REPO = “r6393480-cpu/dld-unit-finder”
+RELEASE_TAG = “latest-data”
+
+DATABASE_URL = (
+f”https://github.com/{GITHUB_REPO}/releases/download/”
+f”{RELEASE_TAG}/dld_units.db.gz”
 )
 
 SQFT_PER_SQM = 10.7639104167
 MAX_AREA_DIFFERENCE = 10.0
-DATABASE_RELEASE = "latest-data"
-DATABASE_FILENAME = "dld_units.db.gz"
+DOWNLOAD_CHUNK_SIZE = 1024 * 1024
+COPY_CHUNK_SIZE = 8 * 1024 * 1024
 
+=========================================================
 
-# --------------------------------------------------
-# TEXT AND NUMBER HELPERS
-# --------------------------------------------------
+TEXT / NUMBER HELPERS
+
+=========================================================
 
 def clean_text(value):
-    value = str(value or "").lower().strip()
-    value = re.sub(r"[^a-z0-9]+", " ", value)
-    return re.sub(r"\s+", " ", value).strip()
+if value is None:
+return “”
 
+value = str(value).strip().lower()
+value = re.sub(r"[^a-z0-9]+", " ", value)
+return re.sub(r"\s+", " ", value).strip()
 
-def parse_number(value):
-    if value is None:
+def to_float(value):
+if value is None:
+return None
+
+try:
+    value = str(value).replace(",", "").strip()
+    match = re.search(r"-?\d+(?:\.\d+)?", value)
+    if not match:
         return None
-
-    try:
-        value = str(value).replace(",", "").strip()
-        result = float(value)
-        return result if result > 0 else None
-    except (ValueError, TypeError):
+    number = float(match.group())
+    if number <= 0:
         return None
-
-
-def extract_number(patterns, text):
-    for pattern in patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            value = parse_number(match.group(1))
-            if value is not None:
-                return value
+    return number
+except (ValueError, TypeError):
     return None
 
+def to_bedroom_count(value):
+if value is None:
+return None
 
-def get_github_repo():
-    try:
-        repo = st.secrets.get("GITHUB_REPO", "")
-    except Exception:
-        repo = ""
+value = str(value).strip().lower()
+if value in {"studio", "studios"}:
+    return 0
+match = re.search(r"\d+", value)
+if match:
+    return int(match.group())
+return None
 
-    return repo or os.getenv(
-        "GITHUB_REPO",
-        "r6393480-cpu/dld-unit-finder",
-    )
+def safe_get(row, column, default=None):
+try:
+return row[column]
+except (KeyError, IndexError, TypeError):
+return default
 
+=========================================================
 
-# --------------------------------------------------
-# DATABASE
-# --------------------------------------------------
+DATABASE DOWNLOAD
+
+STREAMING DOWNLOAD + STREAMING DECOMPRESSION
+
+=========================================================
 
 @st.cache_resource(show_spinner=False)
 def load_database():
-    repo = get_github_repo()
+“””
+Downloads the compressed database in chunks and decompresses
+directly to disk. It does not load the complete database
+into Python memory.
+“””
 
-    database_url = (
-        f"https://github.com/{repo}/releases/download/"
-        f"{DATABASE_RELEASE}/{DATABASE_FILENAME}"
-    )
-
-    response = requests.get(
-        database_url,
-        timeout=180,
-        headers={"User-Agent": "Dubai-DLD-Unit-Finder"},
-    )
-    response.raise_for_status()
-
+data_dir = Path(tempfile.gettempdir()) / "dld_unit_finder"
+data_dir.mkdir(parents=True, exist_ok=True)
+db_path = data_dir / "dld_units.db"
+gzip_path = data_dir / "dld_units.db.gz"
+# Reuse an existing valid database after a Streamlit rerun.
+if db_path.exists() and db_path.stat().st_size > 0:
     try:
-        database_bytes = gzip.decompress(response.content)
-    except OSError as exc:
-        raise RuntimeError(
-            "Database download hui, lekin gzip file open nahi hui. "
-            "GitHub release mein dld_units.db.gz check karo."
-        ) from exc
+        with sqlite3.connect(
+            f"file:{db_path}?mode=ro",
+            uri=True,
+            timeout=30,
+        ) as connection:
+            table = connection.execute(
+                """
+                SELECT name
+                FROM sqlite_master
+                WHERE type = 'table' AND name = 'units'
+                """
+            ).fetchone()
+            if table:
+                columns = [
+                    row[1]
+                    for row in connection.execute(
+                        "PRAGMA table_info(units)"
+                    ).fetchall()
+                ]
+                if columns:
+                    return str(db_path), columns
+    except sqlite3.Error:
+        pass
+    # Remove an incomplete or invalid database.
+    try:
+        db_path.unlink(missing_ok=True)
+    except OSError:
+        pass
+# Download the compressed file to disk in small chunks.
+try:
+    with requests.get(
+        DATABASE_URL,
+        stream=True,
+        timeout=(30, 180),
+        headers={"User-Agent": "DLD-Unit-Finder/1.0"},
+    ) as response:
+        response.raise_for_status()
+        with open(gzip_path, "wb") as output:
+            for chunk in response.iter_content(
+                chunk_size=DOWNLOAD_CHUNK_SIZE
+            ):
+                if chunk:
+                    output.write(chunk)
+except Exception as exc:
+    gzip_path.unlink(missing_ok=True)
+    raise RuntimeError(
+        f"Database download failed: {exc}"
+    ) from exc
+# Decompress to disk without keeping the entire 1.5 GB
+# database in memory.
+temp_db_path = data_dir / "dld_units.partial.db"
+try:
+    with gzip.open(gzip_path, "rb") as source:
+        with open(temp_db_path, "wb") as destination:
+            shutil.copyfileobj(
+                source,
+                destination,
+                length=COPY_CHUNK_SIZE,
+            )
+    # Validate the extracted SQLite database.
+    with sqlite3.connect(
+        f"file:{temp_db_path}?mode=ro",
+        uri=True,
+        timeout=30,
+    ) as connection:
+        table = connection.execute(
+            """
+            SELECT name
+            FROM sqlite_master
+            WHERE type = 'table' AND name = 'units'
+            """
+        ).fetchone()
+        if not table:
+            raise RuntimeError(
+                "The downloaded database has no 'units' table."
+            )
+        columns = [
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(units)"
+            ).fetchall()
+        ]
+        if not columns:
+            raise RuntimeError(
+                "Could not read the database columns."
+            )
+    os.replace(temp_db_path, db_path)
+    gzip_path.unlink(missing_ok=True)
+    return str(db_path), columns
+except Exception as exc:
+    temp_db_path.unlink(missing_ok=True)
+    raise RuntimeError(
+        f"Database extraction/validation failed: {exc}"
+    ) from exc
 
-    database_path = os.path.join(
-        tempfile.gettempdir(),
-        "dld_units.db",
-    )
+=========================================================
 
-    with open(database_path, "wb") as file:
-        file.write(database_bytes)
+PROPERTY FINDER LISTING SCRAPER
 
-    connection = sqlite3.connect(database_path)
-    connection.row_factory = sqlite3.Row
+=========================================================
 
-    tables = connection.execute(
-        "SELECT name FROM sqlite_master WHERE type='table'"
-    ).fetchall()
+def parse_area_from_text(text):
+if not text:
+return None
 
-    table_names = [row["name"] for row in tables]
+patterns = [
+    r"([\d,]+(?:\.\d+)?)\s*(?:sq\.?\s*ft|sqft|sq\s*ft|square feet)",
+    r"([\d,]+(?:\.\d+)?)\s*(?:sq\.?\s*m|sqm|square metres|square meters)",
+]
+for index, pattern in enumerate(patterns):
+    match = re.search(pattern, text, flags=re.IGNORECASE)
+    if match:
+        area = to_float(match.group(1))
+        if area and index == 1:
+            area *= SQFT_PER_SQM
+        return area
+return None
 
-    if "units" not in table_names:
-        connection.close()
-        raise RuntimeError(
-            f"Database mein 'units' table nahi mili. "
-            f"Available tables: {table_names}"
-        )
+def parse_listing_json(data, results):
+if isinstance(data, dict):
+for key, value in data.items():
+key_lower = str(key).lower()
 
-    columns = [
-        row["name"]
-        for row in connection.execute(
-            "PRAGMA table_info(units)"
-        ).fetchall()
-    ]
-
-    if "project_name_en" not in columns:
-        connection.close()
-        raise RuntimeError(
-            "Database ke units table mein project_name_en column nahi hai."
-        )
-
-    connection.close()
-
-    return database_path, columns
-
-
-# --------------------------------------------------
-# PROPERTY FINDER SCRAPER
-# --------------------------------------------------
+        if isinstance(value, (str, int, float)):
+            if key_lower in {
+                "name",
+                "headline",
+                "title",
+            }:
+                results.setdefault("title", str(value))
+            elif key_lower in {
+                "bedrooms",
+                "bedroom",
+                "numberofbedrooms",
+            }:
+                results.setdefault("bedrooms", to_bedroom_count(value))
+            elif key_lower in {
+                "floorarea",
+                "area",
+                "size",
+                "builtuparea",
+                "built_up_area",
+            }:
+                area = to_float(value)
+                if area:
+                    results.setdefault("area", area)
+            elif key_lower in {
+                "projectname",
+                "project_name",
+            }:
+                results.setdefault("project", str(value))
+        elif isinstance(value, (dict, list)):
+            parse_listing_json(value, results)
+elif isinstance(data, list):
+    for item in data:
+        parse_listing_json(item, results)
 
 def scrape_listing(url):
-    response = requests.get(
-        url,
-        timeout=30,
-        headers={
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/131.0.0.0 Safari/537.36"
-            )
-        },
-    )
-    response.raise_for_status()
+parsed = urlparse(url)
 
-    soup = BeautifulSoup(response.text, "html.parser")
-
-    title_tag = soup.find("title")
-    title = (
-        title_tag.get_text(" ", strip=True)
-        if title_tag
-        else ""
-    )
-
-    page_text = soup.get_text(" ", strip=True)
-
-    project = ""
-
-    # Example: Sale in Serenova: ...
-    match = re.search(
-        r"(?:sale|rent)\s+in\s+([^:|]+)",
-        title,
-        re.IGNORECASE,
-    )
-
-    if match:
-        project = match.group(1).strip()
-
-    # Try Open Graph title if needed.
-    if not project:
-        meta = soup.find("meta", property="og:title")
-
-        if meta and meta.get("content"):
-            match = re.search(
-                r"(?:sale|rent)\s+in\s+([^:|]+)",
-                meta["content"],
-                re.IGNORECASE,
-            )
-
-            if match:
-                project = match.group(1).strip()
-
-    # Bedrooms
-    bedrooms = extract_number(
-        [
-            r"\b(\d+)\s*bedrooms?\b",
-            r"\b(\d+)\s*beds?\b",
-            r"\b(\d+)\s*b/?r\b",
-        ],
-        page_text,
-    )
-
-    # Area: identify units explicitly.
-    area_sqft = None
-
-    sqft_value = extract_number(
-        [
-            r"([\d,]+(?:\.\d+)?)\s*sq\.?\s*ft\b",
-            r"([\d,]+(?:\.\d+)?)\s*sqft\b",
-            r"([\d,]+(?:\.\d+)?)\s*ft²\b",
-            r"([\d,]+(?:\.\d+)?)\s*square feet\b",
-        ],
-        page_text,
-    )
-
-    sqm_value = extract_number(
-        [
-            r"([\d,]+(?:\.\d+)?)\s*sq\.?\s*m\b",
-            r"([\d,]+(?:\.\d+)?)\s*sqm\b",
-            r"([\d,]+(?:\.\d+)?)\s*m²\b",
-            r"([\d,]+(?:\.\d+)?)\s*square metres?\b",
-        ],
-        page_text,
-    )
-
-    if sqft_value is not None:
-        area_sqft = sqft_value
-    elif sqm_value is not None:
-        area_sqft = sqm_value * SQFT_PER_SQM
-
-    return {
-        "title": title,
-        "project": project,
-        "bedrooms": (
-            int(bedrooms)
-            if bedrooms is not None
-            else None
+if parsed.scheme not in {"http", "https"}:
+    raise ValueError("Enter a valid Property Finder listing URL.")
+if not parsed.netloc.lower().endswith("propertyfinder.ae"):
+    raise ValueError("Please enter a Property Finder UAE URL.")
+response = requests.get(
+    url,
+    headers={
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/131.0.0.0 Safari/537.36"
         ),
-        "area_sqft": area_sqft,
-    }
-
-
-# --------------------------------------------------
-# DLD AREA NORMALIZATION
-# --------------------------------------------------
-
-def get_dld_area_sqft(record, columns):
-    """
-    Prefer explicitly named sqft fields.
-    Otherwise actual_area is treated as square metres,
-    based on the provided example: 130 m² ≈ 1,399.31 sqft.
-    """
-
-    sqft_columns = [
-        "area_sqft",
-        "unit_area_sqft",
-        "actual_area_sqft",
-    ]
-
-    for column in sqft_columns:
-        if column in columns:
-            value = parse_number(record.get(column))
-
-            if value is not None:
-                return value
-
-    if "actual_area" in columns:
-        value = parse_number(record.get("actual_area"))
-
-        if value is not None:
-            return value * SQFT_PER_SQM
-
-    return None
-
-
-# --------------------------------------------------
-# MANDATORY PROJECT MATCHING
-# --------------------------------------------------
-
-def project_matches(requested_project, dld_project):
-    requested = clean_text(requested_project)
-    actual = clean_text(dld_project)
-
-    if not requested or not actual:
-        return False
-
-    # Require a full normalized project-name match.
-    # This avoids accepting unrelated projects just because
-    # they share one common word.
-    return requested == actual
-
-
-# --------------------------------------------------
-# AREA SCORING
-# --------------------------------------------------
-
-def calculate_area_score(difference):
-    if difference <= 1:
-        return 70
-
-    if difference <= 2:
-        return 68
-
-    if difference <= 5:
-        return 62
-
-    if difference <= 10:
-        return 50
-
-    return 0
-
-
-def find_best_matches(
-    database_path,
-    columns,
-    project,
-    bedrooms,
-    listing_area_sqft,
+        "Accept-Language": "en-US,en;q=0.9",
+    },
+    timeout=(15, 40),
+)
+response.raise_for_status()
+soup = BeautifulSoup(response.text, "html.parser")
+details = {
+    "title": "",
+    "project": "",
+    "area": None,
+    "bedrooms": None,
+}
+title_tag = soup.find("meta", property="og:title")
+if title_tag:
+    details["title"] = title_tag.get("content", "").strip()
+if not details["title"] and soup.title:
+    details["title"] = soup.title.get_text(" ", strip=True)
+# Read embedded JSON-LD where available.
+for script in soup.find_all(
+    "script",
+    attrs={"type": "application/ld+json"},
 ):
-    connection = sqlite3.connect(database_path)
-    connection.row_factory = sqlite3.Row
-
-    # Search within the requested project.
-    # Final project validation is performed separately.
-    rows = connection.execute(
-        """
-        SELECT *
-        FROM units
-        WHERE lower(trim(project_name_en)) LIKE ?
-        """,
-        (f"%{clean_text(project)}%",),
-    ).fetchall()
-
-    connection.close()
-
-    candidates = []
-
-    for sqlite_row in rows:
-        record = dict(sqlite_row)
-
-        dld_project = record.get("project_name_en", "")
-
-        # Project name is mandatory.
-        if not project_matches(project, dld_project):
-            continue
-
-        dld_area_sqft = get_dld_area_sqft(record, columns)
-
-        if dld_area_sqft is None:
-            continue
-
-        difference = abs(dld_area_sqft - listing_area_sqft)
-
-        # Reject candidates that are too far from the listing area.
-        if difference > MAX_AREA_DIFFERENCE:
-            continue
-
-        score = calculate_area_score(difference)
-
-        # Bedrooms are secondary to area.
-        dld_bedrooms = parse_number(record.get("rooms"))
-
-        if bedrooms is not None and dld_bedrooms is not None:
-            if int(dld_bedrooms) == bedrooms:
-                score += 10
-
-        # Small secondary bonus for apartment/flat records.
-        property_subtype = clean_text(
-            record.get("property_sub_type_en", "")
-        )
-
-        if (
-            "apartment" in property_subtype
-            or "flat" in property_subtype
-        ):
-            score += 5
-
-        record["_area_sqft"] = dld_area_sqft
-        record["_area_difference"] = difference
-        record["_score"] = score
-
-        candidates.append(record)
-
-    # Closest area first; secondary score breaks ties.
-    candidates.sort(
-        key=lambda record: (
-            record["_area_difference"],
-            -record["_score"],
-        )
+    try:
+        data = json.loads(script.string or script.get_text())
+        parse_listing_json(data, details)
+    except (ValueError, TypeError):
+        continue
+page_text = soup.get_text(" ", strip=True)
+if details["area"] is None:
+    details["area"] = parse_area_from_text(page_text)
+# Try to identify bedrooms from the page text/title.
+if details["bedrooms"] is None:
+    text_to_check = f"{details['title']} {page_text[:12000]}"
+    bedroom_match = re.search(
+        r"\b(studio|\d+)\s*(?:bedroom|bedrooms|bed)\b",
+        text_to_check,
+        flags=re.IGNORECASE,
     )
+    if bedroom_match:
+        details["bedrooms"] = to_bedroom_count(
+            bedroom_match.group(1)
+        )
+# Extract project from common listing-title format.
+# Example: "Sale in Serenova: GENUINE RESALE ..."
+if not details["project"]:
+    title = details["title"]
+    project_match = re.search(
+        r"\b(?:sale|rent)\s+in\s+([^:|]+)",
+        title,
+        flags=re.IGNORECASE,
+    )
+    if project_match:
+        details["project"] = project_match.group(1).strip()
+return details
 
-    return candidates
+=========================================================
 
+DLD AREA CONVERSION
 
-# --------------------------------------------------
-# STREAMLIT UI
-# --------------------------------------------------
+=========================================================
 
-st.title("Dubai DLD Unit Finder")
+def get_dld_area_sqft(row, columns):
+“””
+Prefer a field explicitly labelled as square feet.
+Otherwise use actual_area as square metres, as indicated
+by the database test case.
+“””
 
-st.write(
-    "Enter a Property Finder listing URL, verify the project "
-    "and area, then search for the closest DLD unit."
+sqft_fields = [
+    "area_sqft",
+    "actual_area_sqft",
+    "unit_area_sqft",
+    "property_area_sqft",
+    "unit_size_sqft",
+]
+for field in sqft_fields:
+    if field in columns:
+        value = to_float(safe_get(row, field))
+        if value:
+            return value
+sqm_fields = [
+    "actual_area",
+    "unit_area",
+    "property_area",
+    "area",
+]
+for field in sqm_fields:
+    if field in columns:
+        value = to_float(safe_get(row, field))
+        if value:
+            return value * SQFT_PER_SQM
+return None
+
+=========================================================
+
+PROJECT MATCHING
+
+=========================================================
+
+def project_matches(requested_project, database_project):
+requested = clean_text(requested_project)
+actual = clean_text(database_project)
+
+if not requested or not actual:
+    return False
+# Mandatory project match; avoid unrelated projects.
+return requested == actual
+
+=========================================================
+
+FIND THE BEST UNIT
+
+Processes database rows incrementally; no fetchall().
+
+=========================================================
+
+def find_best_match(
+db_path,
+columns,
+project,
+listing_area,
+bedrooms=None,
+):
+required_columns = {
+“project_name_en”,
+“unit_number”,
+}
+
+missing = required_columns.difference(columns)
+if missing:
+    raise RuntimeError(
+        "Database is missing required columns: "
+        + ", ".join(sorted(missing))
+    )
+if not project.strip():
+    raise ValueError("Project name is required.")
+if listing_area is None or listing_area <= 0:
+    raise ValueError("Enter a valid listing area in sqft.")
+query = """
+    SELECT *
+    FROM units
+    WHERE lower(trim(project_name_en)) LIKE ?
+"""
+search_pattern = "%" + project.strip().lower() + "%"
+best = None
+candidates_checked = 0
+connection = sqlite3.connect(
+    f"file:{db_path}?mode=ro",
+    uri=True,
+    timeout=60,
+)
+connection.row_factory = sqlite3.Row
+try:
+    cursor = connection.execute(query, (search_pattern,))
+    # Iterate through the SQLite cursor rather than loading
+    # every row into RAM.
+    for row in cursor:
+        database_project = safe_get(row, "project_name_en")
+        if not project_matches(project, database_project):
+            continue
+        candidates_checked += 1
+        area_sqft = get_dld_area_sqft(row, columns)
+        if area_sqft is None:
+            continue
+        area_difference = abs(area_sqft - listing_area)
+        # Do not return a candidate whose area is too far away.
+        if area_difference > MAX_AREA_DIFFERENCE:
+            continue
+        database_bedrooms = None
+        for bedroom_column in (
+            "rooms",
+            "bedrooms",
+            "number_of_bedrooms",
+        ):
+            if bedroom_column in columns:
+                database_bedrooms = to_bedroom_count(
+                    safe_get(row, bedroom_column)
+                )
+                if database_bedrooms is not None:
+                    break
+        bedroom_match = (
+            bedrooms is not None
+            and database_bedrooms is not None
+            and bedrooms == database_bedrooms
+        )
+        subtype = safe_get(
+            row,
+            "property_sub_type_en",
+            "",
+        )
+        # Area is the primary criterion.
+        # Bedroom agreement is only a tie-breaker.
+        candidate = {
+            "unit_number": safe_get(row, "unit_number"),
+            "project": database_project,
+            "area_sqft": area_sqft,
+            "area_difference": area_difference,
+            "bedrooms": database_bedrooms,
+            "bedroom_match": bedroom_match,
+            "property_type": subtype,
+        }
+        if best is None:
+            best = candidate
+        elif candidate["area_difference"] < best["area_difference"]:
+            best = candidate
+        elif (
+            candidate["area_difference"] == best["area_difference"]
+            and candidate["bedroom_match"]
+            and not best["bedroom_match"]
+        ):
+            best = candidate
+finally:
+    connection.close()
+return best, candidates_checked
+
+=========================================================
+
+STREAMLIT UI
+
+=========================================================
+
+st.title(“Dubai DLD Unit Finder”)
+st.caption(
+“Match a Property Finder listing against the DLD database.”
 )
 
-with st.form("listing_form"):
-    listing_url = st.text_input(
-        "Property Finder listing URL",
-        placeholder=(
-            "https://www.propertyfinder.ae/en/plp/..."
-        ),
-    )
+st.info(
+“The app prioritizes project name and the closest area. “
+“It will not select a unit if no candidate is within “
+f”{MAX_AREA_DIFFERENCE:.0f} sqft of the listing area.”
+)
 
-    fetch_listing = st.form_submit_button(
-        "Read Listing Details",
-        type="secondary",
-    )
+with st.form(“listing_form”):
+listing_url = st.text_input(
+“Property Finder listing URL”,
+placeholder=“https://www.propertyfinder.ae/en/plp/…”,
+)
 
+read_listing = st.form_submit_button(
+    "Read Listing Details",
+    type="primary",
+)
 
-if fetch_listing:
-    if not listing_url.strip():
-        st.error("Please enter a Property Finder URL.")
-        st.stop()
+if read_listing:
+if not listing_url.strip():
+st.error(“Please enter a Property Finder listing URL.”)
+else:
+try:
+with st.spinner(“Reading listing details…”):
+scraped = scrape_listing(listing_url.strip())
 
-    parsed_url = urlparse(listing_url.strip())
-
-    if (
-        parsed_url.scheme not in ("http", "https")
-        or "propertyfinder.ae" not in parsed_url.netloc.lower()
-    ):
-        st.error("Please enter a valid Property Finder URL.")
-        st.stop()
-
-    try:
-        with st.spinner("Reading listing details..."):
-            listing = scrape_listing(listing_url.strip())
-
-        st.session_state["listing_details"] = listing
         st.session_state["listing_url"] = listing_url.strip()
+        st.session_state["scraped_listing"] = scraped
+        st.success("Listing page processed.")
+    except Exception as exc:
+        st.error(f"Could not read the listing: {exc}")
 
-    except Exception as error:
-        st.error(f"Could not read listing: {error}")
+scraped = st.session_state.get(“scraped_listing”, {})
 
+if scraped:
+st.subheader(“Listing details”)
 
-# Keep the details visible after Streamlit reruns.
-listing = st.session_state.get("listing_details")
-
-if listing:
-    st.subheader("Listing Details")
-
-    st.write(f"**Title:** {listing['title'] or 'Not detected'}")
-
-    with st.form("matching_form"):
-        project_name = st.text_input(
-            "Project name (mandatory)",
-            value=listing.get("project") or "",
+with st.form("matching_form"):
+    project = st.text_input(
+        "Project name (required)",
+        value=scraped.get("project") or "",
+    )
+    default_area = scraped.get("area")
+    area_input = st.number_input(
+        "Listing area (sqft)",
+        min_value=0.0,
+        value=float(default_area or 0.0),
+        step=1.0,
+        format="%.2f",
+    )
+    scraped_bedrooms = scraped.get("bedrooms")
+    bedroom_options = [
+        "Not specified",
+        "Studio",
+        "1",
+        "2",
+        "3",
+        "4",
+        "5",
+        "6",
+        "7",
+        "8",
+    ]
+    default_bedroom_index = 0
+    if scraped_bedrooms is not None:
+        bedroom_label = (
+            "Studio"
+            if scraped_bedrooms == 0
+            else str(scraped_bedrooms)
         )
-
-        default_area = listing.get("area_sqft")
-        area_value = (
-            str(round(default_area, 2))
-            if default_area is not None
-            else ""
-        )
-
-        area_input = st.text_input(
-            "Listing area in sqft",
-            value=area_value,
-        )
-
-        default_bedrooms = listing.get("bedrooms")
-        bedrooms_value = (
-            str(default_bedrooms)
-            if default_bedrooms is not None
-            else ""
-        )
-
-        bedrooms_input = st.text_input(
-            "Bedrooms",
-            value=bedrooms_value,
-        )
-
-        run_matching = st.form_submit_button(
-            "Run Matching",
-            type="primary",
-        )
-
-    # IMPORTANT:
-    # This block is outside the form and runs after submission.
-    if run_matching:
-        if not project_name.strip():
-            st.error("Project name is mandatory.")
-            st.stop()
-
-        listing_area_sqft = parse_number(area_input)
-
-        if listing_area_sqft is None:
-            st.error("Enter the listing area in sqft.")
-            st.stop()
-
-        bedrooms_number = parse_number(bedrooms_input)
-
-        if bedrooms_number is not None:
-            bedrooms_number = int(bedrooms_number)
-
+        if bedroom_label in bedroom_options:
+            default_bedroom_index = bedroom_options.index(
+                bedroom_label
+            )
+    bedroom_selection = st.selectbox(
+        "Bedrooms",
+        options=bedroom_options,
+        index=default_bedroom_index,
+    )
+    run_matching = st.form_submit_button(
+        "Run Matching",
+        type="primary",
+    )
+if run_matching:
+    if not project.strip():
+        st.error("Project name is mandatory.")
+    elif area_input <= 0:
+        st.error("Enter the correct listing area in sqft.")
+    else:
+        if bedroom_selection == "Not specified":
+            selected_bedrooms = None
+        elif bedroom_selection == "Studio":
+            selected_bedrooms = 0
+        else:
+            selected_bedrooms = int(bedroom_selection)
         try:
-            with st.spinner("Loading DLD database..."):
-                database_path, database_columns = load_database()
-
-            with st.spinner("Searching for matching units..."):
-                matches = find_best_matches(
-                    database_path=database_path,
-                    columns=database_columns,
-                    project=project_name.strip(),
-                    bedrooms=bedrooms_number,
-                    listing_area_sqft=listing_area_sqft,
+            with st.spinner(
+                "Preparing database and matching units..."
+            ):
+                db_path, db_columns = load_database()
+                best, checked = find_best_match(
+                    db_path=db_path,
+                    columns=db_columns,
+                    project=project.strip(),
+                    listing_area=float(area_input),
+                    bedrooms=selected_bedrooms,
                 )
-
-            if not matches:
-                st.error(
-                    "No matching unit found within 10 sqft. "
-                    "Check the project name, area and DLD database."
-                )
-                st.info(
-                    "The app will not select a unit with a large area "
-                    "mismatch just because its project or bedrooms match."
-                )
-                st.stop()
-
-            best = matches[0]
-
-            st.success("Closest matching DLD record")
-
-            st.metric(
-                "DLD Unit Number",
-                str(best.get("unit_number") or "Not available"),
-            )
-
-            st.write(
-                f"**Project:** {best.get('project_name_en', '')}"
-            )
-            st.write(
-                f"**Listing area:** {listing_area_sqft:,.2f} sqft"
-            )
-            st.write(
-                f"**DLD area:** {best['_area_sqft']:,.2f} sqft"
-            )
-            st.write(
-                f"**Area difference:** "
-                f"{best['_area_difference']:.2f} sqft"
-            )
-            st.write(f"**Bedrooms:** {best.get('rooms', 'Unknown')}")
-            st.write(f"**Candidates within 10 sqft:** {len(matches)}")
-
-            if best["_area_difference"] > 1:
+            st.subheader("Matching result")
+            if best is None:
                 st.warning(
-                    "This is the closest candidate, not an exact-area match."
+                    "No sufficiently close match was found for "
+                    "this project and area. No unit number selected."
                 )
+                st.caption(
+                    f"Project records checked: {checked}. "
+                    f"Maximum allowed area difference: "
+                    f"{MAX_AREA_DIFFERENCE:.0f} sqft."
+                )
+            else:
+                st.success("Best matching candidate found.")
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.metric(
+                        "DLD Unit Number",
+                        str(best["unit_number"]),
+                    )
+                with col2:
+                    st.metric(
+                        "Area difference",
+                        f'{best["area_difference"]:.2f} sqft',
+                    )
+                st.write(
+                    "**Project:**",
+                    best["project"],
+                )
+                st.write(
+                    "**Listing area:**",
+                    f"{area_input:.2f} sqft",
+                )
+                st.write(
+                    "**DLD area:**",
+                    f'{best["area_sqft"]:.2f} sqft',
+                )
+                if best["bedrooms"] is not None:
+                    st.write(
+                        "**DLD bedrooms/rooms field:**",
+                        best["bedrooms"],
+                    )
+                if best["property_type"]:
+                    st.write(
+                        "**Property subtype:**",
+                        best["property_type"],
+                    )
+                st.caption(
+                    "This is the closest candidate under the "
+                    "configured area threshold, not a guarantee "
+                    "of the unit's identity. Verify against the "
+                    "official listing or DLD record."
+                )
+        except Exception as exc:
+            st.error(f"Error running matching: {exc}")
+            st.caption(
+                "If the error mentions disk space, the hosting "
+                "environment may not have enough storage for the "
+                "1.5 GB uncompressed database."
+            )
 
-            if len(matches) > 1:
-                with st.expander("View other matching candidates"):
-                    for index, candidate in enumerate(matches[:10], start=1):
-                        st.markdown(
-                            f"**{index}. Unit "
-                            f"{candidate.get('unit_number', 'Unknown')}** — "
-                            f"{candidate['_area_sqft']:,.2f} sqft; "
-                            f"difference "
-                            f"{candidate['_area_difference']:.2f} sqft; "
-                            f"score {candidate['_score']}"
-                        )
-
-            with st.expander("DLD record details"):
-                st.json({
-                    key: value
-                    for key, value in best.items()
-                    if not key.startswith("_")
-                })
-
-        except Exception as error:
-            st.error(f"Matching failed: {error}")
+st.divider()
+st.caption(“DLD database is loaded locally for matching.”)
