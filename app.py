@@ -19,12 +19,12 @@ CONFIGURATION
 
 st.set_page_config(
 page_title="Dubai DLD Unit Finder",
-page_icon=“🏢”,
-layout=“wide”,
+page_icon="🏢",
+layout="wide",
 )
 
-GITHUB_REPO = “r6393480-cpu/dld-unit-finder”
-RELEASE_TAG = “latest-data”
+GITHUB_REPO = "r6393480-cpu/dld-unit-finder"
+RELEASE_TAG = "latest-data"
 
 DATABASE_URL = (
 f”https://github.com/{GITHUB_REPO}/releases/download/”
