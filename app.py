@@ -88,7 +88,7 @@ DATABASE DOWNLOAD AND EXTRACTION
 
 @st.cache_resource(show_spinner=False)
 def load_database():
-data_dir = Path(tempfile.gettempdir()) / “dld_unit_finder”
+data_dir = Path(tempfile.gettempdir()) / "dld_unit_finder"
 data_dir.mkdir(parents=True, exist_ok=True)
 
 db_path = data_dir / "dld_units.db"
