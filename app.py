@@ -27,8 +27,8 @@ GITHUB_REPO = "r6393480-cpu/dld-unit-finder"
 RELEASE_TAG = "latest-data"
 
 DATABASE_URL = (
-f”https://github.com/{GITHUB_REPO}/releases/download/”
-f”{RELEASE_TAG}/dld_units.db.gz”
+f"https://github.com/{GITHUB_REPO}/releases/download/"
+f"{RELEASE_TAG}/dld_units.db.gz"
 )
 
 SQFT_PER_SQM = 10.7639104167
