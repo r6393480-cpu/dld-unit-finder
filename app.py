@@ -18,7 +18,7 @@ CONFIGURATION
 =========================================================
 
 st.set_page_config(
-page_title=“Dubai DLD Unit Finder”,
+page_title="Dubai DLD Unit Finder",
 page_icon=“🏢”,
 layout=“wide”,
 )
