@@ -44,7 +44,7 @@ HELPERS
 
 def clean_text(value):
 if value is None:
-return “”
+return ""
 
 value = str(value).strip().lower()
 value = re.sub(r"[^a-z0-9]+", " ", value)
